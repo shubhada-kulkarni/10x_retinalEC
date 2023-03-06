@@ -1,0 +1,859 @@
+---
+title: "10X"
+output: html_document
+date: "2022-12-07"
+---
+
+# Loading required libraries
+```{r}
+library(Seurat)
+library(ggplot2)
+library(rmarkdown)
+library(markdown)
+library(viridisLite)
+library(SingleCellExperiment)
+library(dplyr)
+library(Matrix.utils)
+library(magrittr)
+library(DESeq2)
+library(ggrepel)
+```
+
+# Functions
+Different functions for the analysis
+```{r eval=FALSE}
+# First, find an optimum threshold for assignment probability values
+return_cells <- function(file_ap){
+  # ipnut: assignment probability file
+  # output: dataframe/vector with cells to be included in the analysis
+  #file_ap <- "/omics/odcf/analysis/OE0228_projects/endothelial_cells/s467i/scRNA-seq/Denise/Denise_10X/output_SampleA/outs/multi/multiplexing_analysis/assignment_confidence_table.csv"
+  data_ap <- read.table(file_ap, header = T, sep = ",", row.names = 1)
+  data_ap <- data_ap[! data_ap$Assignment %in% c("Multiplet", "Blank"),]      # do not consider Multiples and Blanks
+  data_ap$hash_max_index <- apply(data_ap[1:10], 1, which.max) 
+  data_ap$final_flag <- rep("TRUE", nrow(data_ap))
+  for (i in 1:nrow(data_ap)){
+    ind <- data_ap[i, "hash_max_index"]
+    if (data_ap[i, "Assignment"] == "Unassigned"){
+      if (data_ap[i,ind] != data_ap[i,"Assignment_Probability"]){
+        data_ap[i,"final_flag"] <- FALSE
+      }
+    }
+  }
+  # add the final assignment column
+  data_ap$final_assignment <- paste("hash", data_ap$hash_max_index, sep = "")
+  # change the cell names to include hash information so as to separate cre+ and cre- in later seurat analysis
+  data_ap$final_cellnames <- paste(data_ap$final_assignment,"_",data_ap$Barcode, sep="")
+  return(data_ap)
+}
+
+# function for creating the seurat object
+create_process_seurat <- function(data_dir, data_ap){
+  # filtered cellnames
+  cellnames <- data_ap$Barcode[data_ap$final_flag == "TRUE"]
+  # read in the files
+  #data_dir <- 'output_SampleA/outs/multi/count/raw_feature_bc_matrix/'
+  list.files(data_dir) # Should show barcodes.tsv.gz, features.tsv.gz, and matrix.mtx.gz
+  data <- Read10X(data.dir = data_dir)
+  seurat_object <- CreateSeuratObject(counts = data$`Gene Expression`[,cellnames], min.cells = 3, min.features = 200)
+  seurat_object[['hash']] = CreateAssayObject(counts = data$`Multiplexing Capture`[,cellnames])
+  
+  # process seurat
+  seurat_object<-FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures=2000)
+  head(VariableFeatures(seurat_object),10)
+  seurat_object<-ScaleData(seurat_object)
+  seurat_object<-NormalizeData(seurat_object)
+  seurat_object<-RunPCA(seurat_object)
+  seurat_object<-FindNeighbors(seurat_object)
+  seurat_object<-FindClusters(seurat_object)
+  seurat_object<-RunUMAP(seurat_object, dims=1:10)
+  
+  # change cell names in order to include hash names in them (so we know which samples they come from and also if they are cre- or +)
+  newcellnames <- data_ap$final_cellnames[data_ap$Barcode %in% Cells(seurat_object)]
+  seurat_object <- RenameCells(seurat_object, old.names = cellnames, new.names = newcellnames)
+  return(seurat_object)
+}
+```
+
+# Analysis 
+First, create the seurat objects from newly assigned cells
+```{r eval=F}
+# Sample A
+assignment_data_A <- return_cells("output_SampleA/outs/multi/multiplexing_analysis/assignment_confidence_table.csv")
+seurat_A <- create_process_seurat("output_SampleA/outs/multi/count/raw_feature_bc_matrix/", assignment_data_A)
+seurat_A@meta.data$hash <- unlist(lapply(rownames(seurat_A@meta.data), function(x) strsplit(x, "_")[[1]][1]))
+# to check if bad cells are coming from new assignment
+seurat_A@meta.data$oldhash <- assignment_data_A$Assignment[match(rownames(seurat_A@meta.data), assignment_data_A$final_cellnames)]
+
+# Sample B
+assignment_data_B <- return_cells("output_SampleB/outs/multi/multiplexing_analysis/assignment_confidence_table.csv")
+## later modified the sampleB assignment probabilites to only include the cells originally assignned by cellranger
+assignment_data_B$final_flag <- ifelse(grepl("hash", assignment_data_B$Assignment), TRUE, FALSE)
+seurat_B <- create_process_seurat("output_SampleB/outs/multi/count/raw_feature_bc_matrix/", assignment_data_B)
+seurat_B@meta.data$hash <- unlist(lapply(rownames(seurat_B@meta.data), function(x) strsplit(x, "_")[[1]][1]))
+# to check if bad cells are coming from new assignment
+seurat_B@meta.data$oldhash <- assignment_data_B$Assignment[match(rownames(seurat_B@meta.data), assignment_data_B$final_cellnames)]
+```
+
+UMAP plot for Sample A
+```{r fig.align='center',width=20}
+DimPlot(seurat_A, label = T)
+```
+
+UMAP plot for Sample B
+```{r fig.align='center',width=20}
+DimPlot(seurat_B, label = T)
+```
+
+First, endothelial cell markers to confirm th identity; sample A
+```{r fig.align='center',width=20}
+FeaturePlot(seurat_A, c("Pecam1", "Cldn5"), label = T)
+```
+
+Sample B
+```{r fig.align='center',width=20}
+FeaturePlot(seurat_B, c("Pecam1", "Cldn5"), label = T)
+```
+
+# Merge the two samples in order to perform the cluster annotation
+Merge and perform the dimensional reduction
+```{r eval=FALSE}
+denise_10x <- merge(x = seurat_A, y = seurat_B, add.cell.ids = c("sampleA", "sampleB"), project = "10X", merge.data = TRUE)
+denise_10x <- ScaleData(denise_10x)
+# dimensional reduction again
+denise_10x <- FindVariableFeatures(denise_10x, selection.method = "vst", nfeatures=2000)
+denise_10x<-RunPCA(denise_10x)
+denise_10x<-FindNeighbors(denise_10x)
+denise_10x<-FindClusters(denise_10x)
+denise_10x<-RunUMAP(denise_10x, dims=1:10)
+```
+
+Adjust the metadata in order to add different information to the seurat object
+```{r eval=F}
+denise_10x@meta.data$sample <- unlist(lapply(rownames(denise_10x@meta.data), function(x) 
+  strsplit(x, "_")[[1]][1]))
+denise_10x@meta.data$sample_hash <- paste(denise_10x@meta.data$sample, denise_10x@meta.data$hash, sep = "_")
+# also add the cre+ or - information to this dataframe. First create a dataframe in order to map the info
+hash_cre_df <- read.table("cre_table.tab", header = F)
+denise_10x@meta.data$cre <- hash_cre_df$V2[match(denise_10x@meta.data$sample_hash, hash_cre_df$V1)]
+```
+
+Clustering colored by the samples (to varify no batch effect during merging)
+```{r fig.align='center',width=20}
+DimPlot(denise_10x, group.by = "sample", label = T)
+```
+
+Clustering by cre+ or- to see if any specific cluster for each condition
+```{r fig.align='center',width=20}
+DimPlot(denise_10x, group.by = "cre", label = T)
+```
+
+Expression of markers for each celltype
+```{r fig.align='center',width=20,height=40}
+# Hmgn2high;Ptgishigh), proliferative (Mki67+;Birc5+), capillary (Mfsd2ahigh;Slc22a8high), arterial (Unc5b+;Bmx+), and tip cell EC clusters (Kcne3+;Angpt2+
+FeaturePlot(denise_10x, c("Hmgb2", "Mki67", "Spock2", "Bmx", "Igfbp3"), label = T, pt.size = 1)
+
+creneg_cells <- rownames(denise_10x@meta.data)[denise_10x@meta.data$cre == "Cre-"]
+sum(denise_10x@assays$RNA@data["Terf1", creneg_cells] > 0)
+crepos_cells <- rownames(denise_10x@meta.data)[denise_10x@meta.data$cre == "Cre+"]
+sum(denise_10x@assays$RNA@data["Terf1", crepos_cells] > 0)
+```
+
+Terf expression at mouse level for Cre- and Cre+
+```{r}
+for (each in unique(denise_10x@meta.data$sample_hash)){
+  cells <- rownames(denise_10x@meta.data)[denise_10x@meta.data$sample_hash == each]
+  print(paste(each, length(cells)))
+  print(summary(denise_10x@assays$RNA@data["Terf1", cells]))
+}
+```
+
+Marker gene analysis on the denise_10x object
+```{r}
+markers_denise_10x <- FindAllMarkers(denise_10x)
+write.csv(markers_denise_10x, "markers_denise10x.csv", quote = F)
+```
+
+
+
+<!-- Add the cluster annotations -->
+<!-- ```{r} -->
+<!-- denise_10x_ann <- RenameIdents(denise_10x, `0` = "Capillary", `1` = "Capillary", `2` = "Capillary", `9` = "Capillary", `11` = "Capillary", -->
+<!--                                `3` = "Artery", `10` = "Artery", `4` = "Venous", `5` = "Venous", `6` = "Venous", `7` = "Venous") -->
+<!-- ``` -->
+
+# Markers between cre+ and -
+FindConservedMarkers will find markers for individual cluster against all other clusters combined but consereved between two conditions.
+```{r}
+library(writexl)
+markers_cre <- list()
+for (eachident in sort(unique(Idents(denise_10x)))){
+  markers_cre[[eachident]] <- FindConservedMarkers(denise_10x, ident.1 = eachident, grouping.var = "cre")
+}
+write_xlsx(markers_cre, "markers_denise10x_cre_allclusters.xlsx", col_names = T)
+```
+
+To differential between the cre+ and -, find markers that are different between these two. To do this, rename the idents
+```{r}
+denise_10x$original_cluster <- 
+  Idents(denise_10x) <- "celltype.condition"
+```
+
+# Some checks for low UMI cells
+For Terf1 positive and negative cells, check the difference between the UMI numbers per cell
+```{r}
+terf1_pos_cells <- colnames(denise_10x@assays$RNA@data)[denise_10x@assays$RNA@data["Terf1",] > 0]
+terf1_neg_cells <- colnames(denise_10x@assays$RNA@data)[denise_10x@assays$RNA@data["Terf1",] == 0]
+umi_terf1_pos <- denise_10x$nFeature_RNA[rownames(denise_10x@meta.data) %in% terf1_pos_cells]
+umi_terf1_neg <- denise_10x$nFeature_RNA[rownames(denise_10x@meta.data) %in% terf1_neg_cells]
+df_pos <- data.frame(value = umi_terf1_pos, variable = "Terf1+")
+df_neg <- data.frame(value = umi_terf1_neg, variable = "Terf-")
+df <- rbind(df_pos, df_neg)
+ggplot(df, aes(x = variable, y = value, col=as.factor(variable))) + geom_violin(aes(fill = variable), scale = "width", adjust = 1, width = 0.5) +
+  theme(legend.position = "none")
+```
+
+# Pseudo-bulk analysis
+PCA plots at pseudo-bulk level to check if the bad Terf1 mice are falling together on PCA level
+```{r}
+## initial processing
+counts <- denise_10x@assays$RNA@counts    # ExtractING raw counts and metadata to create SingleCellExperiment object
+metadata <- denise_10x@meta.data          # Set up metadata as desired for aggregation and DE analysis
+metadata$cluster_id <- factor(denise_10x@active.ident) 
+## Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+sce$sample_hash <- factor(sce$sample_hash)
+sce$cre <- factor(sce$cre)
+## aggregation
+groups <- colData(sce)[, c("sample_hash")]
+pb <- aggregate.Matrix(t(counts(sce)), groupings = groups, fun = "sum") # Aggregate across cluster-sample groups
+## creating deseq object for further analysis
+metadata <- data.frame(rownames(pb))
+metadata$sampleid <- metadata$rownames.pb.
+metadata$samplename <- unlist(lapply(metadata$sampleid, function(x) strsplit(x, "_")[[1]][1]))
+metadata$hash <- unlist(lapply(metadata$sampleid, function(x) strsplit(x, "_")[[1]][2]))
+metadata$cre <- hash_cre_df$V2[match(metadata$sampleid, hash_cre_df$V1)]
+rownames(metadata) <- metadata$sampleid
+metadata$cre <- ifelse(metadata$cre == "Cre+", "pos", "neg")
+dds <- DESeqDataSetFromMatrix(t(pb+1), colData = metadata, design = ~ cre)
+rld <- rlog(dds, blind=TRUE)
+```
+
+PCA plot
+```{r}
+# coloring based on samples
+pca <- DESeq2::plotPCA(rld, intgroup = "samplename")
+pca_data <- DESeq2::plotPCA(rld, intgroup = "samplename", returnData = T)
+pca + geom_label_repel(data = pca_data, aes(label = name)) 
+# coloring based on cre
+pca_cre <- DESeq2::plotPCA(rld, intgroup = "cre")
+pca_data_cre <- DESeq2::plotPCA(rld, intgroup = "cre", returnData = T)
+pca_cre + geom_label_repel(data = pca_data_cre, aes(label = name)) 
+```
+
+PCA plot samples separated
+```{r}
+# sample A
+rld_a <- rld[,colData(rld)$samplename == "sampleA"]
+pca_a <- DESeq2::plotPCA(rld_a, intgroup = "cre")
+pca_data_a <- DESeq2::plotPCA(rld_a, intgroup = "cre", returnData = T)
+pca_a + geom_label_repel(data = pca_data_a, aes(label = name)) 
+# sample B
+rld_b <- rld[,colData(rld)$samplename == "sampleB"]
+pca_b <- DESeq2::plotPCA(rld_b, intgroup = "cre")
+pca_data_b <- DESeq2::plotPCA(rld_b, intgroup = "cre", returnData = T)
+pca_b + geom_label_repel(data = pca_data_b, aes(label = name)) 
+```
+
+Like Terf, check the expression of Esr1
+```{r}
+for (each in unique(denise_10x@meta.data$sample_hash)){
+  cells <- rownames(denise_10x@meta.data)[denise_10x@meta.data$sample_hash == each]
+  print(paste(each, length(cells)))
+  print(summary(denise_10x@assays$RNA@data["Esr1", cells]))
+}
+```
+
+# Analysis on selected mice
+Denise gave a list of mice to be included for the final analysis. So repeat the above steps by only considering these mice.
+
+## PCA plot
+```{r}
+mice_include <- c("sampleA_hash1", "sampleA_hash2", "sampleA_hash4", "sampleA_hash5", "sampleA_hash6", "sampleA_hash7",
+                  "sampleB_hash2", "sampleB_hash3", "sampleB_hash4", "sampleB_hash5", "sampleB_hash6", "sampleB_hash7", "sampleB_hash8",
+                  "sampleB_hash10")
+
+rld_final <- rld[,colData(rld)$sampleid %in% mice_include]
+pca_final <- DESeq2::plotPCA(rld_final, intgroup = "cre")
+pca_data_final <- DESeq2::plotPCA(rld_final, intgroup = "cre", returnData = T)
+pca_final + geom_label_repel(data = pca_data_final, aes(label = name)) 
+```
+
+## UMAP plot
+```{r}
+denise_10x_final <- subset(denise_10x, subset = sample_hash %in% mice_include)
+# recluster
+denise_10x_final<-FindNeighbors(denise_10x_final)
+denise_10x_final<-FindClusters(denise_10x_final, resolution = 2)
+denise_10x_final<-RunUMAP(denise_10x_final, dims=1:10)
+```
+
+Plots
+```{r}
+DimPlot(denise_10x_final, split.by = "cre", label = T)
+VlnPlot(denise_10x_final, "nFeature_RNA")
+```
+
+Markers for new clustering
+```{r}
+markers_final <- FindAllMarkers(denise_10x_final)
+write.csv(markers_final, "markers_final.csv", quote = F)
+```
+
+Featureplot for venous + artery + capillary markers
+```{r}
+FeaturePlot(denise_10x_final, c("Hmgb2", "Mki67", "Spock2", "Bmx"), label = T, pt.size = 1)
+```
+
+Featureplot for pericyte and lymphatic marker (for cluster 12)
+```{r}
+# FoxC2 (lymphatics marker) and Gucy1a1 and Gucy1b1 (pericyte marker)?
+FeaturePlot(denise_10x_final, c("Foxc2", "Gucy1a1", "Gucy1b1"), label = T, pt.size = 1)
+```
+
+Checking where do the cluster 12 cells come from (possible contamination?)
+```{r}
+tmp <- WhichCells(denise_10x_final, idents = 8)
+names(denise_10x_final@assays$RNA@data["Foxc2", tmp] > 0)
+table(unlist(lapply(names(denise_10x_final@assays$RNA@data["Foxc2", tmp] > 0), function(x) strsplit(x, "_")[1][[1]][1])))
+unlist(lapply(names(denise_10x_final@assays$RNA@data["Foxc2", tmp] > 0), function(x) strsplit(x, "_")[1][[1]][2]))
+# for cluster 10
+table(unlist(lapply(tmp, function(x) strsplit(x, "_")[1][[1]][1])))
+table(unlist(lapply(tmp, function(x) strsplit(x, "_")[1][[1]][2])))
+# or
+table(denise_10x_final@meta.data$hash[rownames(denise_10x_final@meta.data) %in% tmp])
+```
+
+Removing bad clusters and renaming the others
+```{r}
+# first remove
+denise_10x_annotated <- subset(x = denise_10x_final, idents = c(0, 7, 12), invert = TRUE)
+denise_10x_annotated <- RenameIdents(denise_10x_annotated, `3` = "Proliferative venous", `11` = "Proliferative venous", `5` = "Non-proliferative venous", `2` = "Capillary", `10` = "Capillary", `6` = "Capillary", `1` = "Capillary", `4` = "Arterial",
+                                     `9` = "Arterial", `8` = "Stalk cells")
+```
+
+# Some annotation changes
+Denise thinks that some annotations are different. So first checked the featureplots of certain marker genes.
+```{r}
+ggsave(filename = "featureplot_D-tip.png", FeaturePlot(denise_10x_final, c("Apod", "Spock2", "Itm2a"), label = T, pt.size = 0.75, ncol = 3), width = 12, height = 5)   # D-tip cell (cluster 1): Apod, Spock2, Itm2a
+ggsave(filename = "featureplot_S-tip.png", FeaturePlot(denise_10x_final, c("Apln", "Kcne3", "S100a3"), label = T, pt.size = 0.75, ncol = 3), width = 12, height = 5)   # S-tip cell (cluster 5): Apln, Kcne3, S100a3
+ggsave(filename = "featureplot_artery.png", FeaturePlot(denise_10x_final, c("Bmx"), label = T, pt.size = 0.75, ncol = 1), width = 6, height = 5)   # Arterial (Cluster 4): Bmx
+ggsave(filename = "featureplot_venous.png", FeaturePlot(denise_10x_final, c("Aplnr", "Nr2f2"), label = T, pt.size = 0.75, ncol = 2), width = 10, height = 5)   # Venous (cluster 6): Aplnr, Nr2f2
+ggsave(filename = "featureplot_capillary.png", FeaturePlot(denise_10x_final, c("Abca1", "Dach1"), label = T, pt.size = 0.75, ncol = 2), width = 10, height = 5)   # Capillary (cluster 2): Abca1, Dach1
+ggsave(filename = "featureplot_proliferating.png", FeaturePlot(denise_10x_final, c("Mki67"), label = T, pt.size = 0.75, ncol = 1), width = 6, height = 5)   # Proliferating cells (Cluster 12 and 13): Mki67
+# featureplots Tie1 and Tie2
+ggsave(filename = "featureplot_Tie.png", FeaturePlot(denise_10x_final, c("Tie1", "Tie2"), label = T, pt.size = 0.75, ncol = 2), width = 10, height = 5)   # because Denise wanted these
+```
+
+Modified annotations (12-01-2023)
+```{r}
+# tip cells
+FeaturePlot(denise_10x_final, c("Kcne3", "Esm1", "Angpt2"), label = T, pt.size = 0.5, order = T, ncol = 3)
+# capillary
+FeaturePlot(denise_10x_final, c("Hmgcs2", "Mfap2"), label = T, pt.size = 0.5, order = T, ncol = 3)
+# venous 
+FeaturePlot(denise_10x_final, c("Nr2f2", "Flrt2", "Scc38a5", "Aldh1a1"), label = T, pt.size = 0.5, order = T, ncol = 3) # from table + % cutoff
+FeaturePlot(denise_10x_final, c("Hmgn2", "Ptgis"), label = T, pt.size = 0.5, order = T, ncol = 2)  # from paper
+# Proliferative
+FeaturePlot(denise_10x_final, c("Mki67", "Top2a", "Prc1"), label = T, pt.size = 0.5, order = T, ncol = 3)
+# arterial
+FeaturePlot(denise_10x_final, c("Bmx", "Stmn2", "Nebl"), label = T, pt.size = 0.5, order = T, ncol = 3)
+# stalk
+FeaturePlot(denise_10x_final, c("C1qtnf9", "Cd36"), label = T, pt.size = 0.5, order = T, ncol = 2)
+# cap + venous
+FeaturePlot(denise_10x_final, c("Hmgn2", "Ptgis", "Mfsd2a", "Slc22a8"), label = T, pt.size = 0.5, order = T, ncol = 2)  # from paper
+```
+
+Annotating the clusters
+```{r}
+# remove cells from cluster 4 and 9 that have nFeature less than 2000
+cells <- WhichCells(denise_10x_final, idents = c(4, 9))
+nfeature_cells <- denise_10x_final@meta.data[cells, "nFeature_RNA"]
+names(nfeature_cells) <- cells
+toremove <- names(which(nfeature_cells < 2000))
+denise_10x_annotated <- subset(x = denise_10x_final, idents = c(0, 20, 21), cells = toremove, invert = TRUE)
+denise_10x_annotated <- denise_10x_annotated[,!colnames(denise_10x_annotated) %in% toremove]
+# because cluster 4 looked weird, try to recluster
+denise_10x_annotated<-FindNeighbors(denise_10x_annotated)
+denise_10x_annotated<-FindClusters(denise_10x_annotated, resolution = 1)
+denise_10x_annotated<-RunUMAP(denise_10x_annotated, dims=1:10)
+
+denise_10x_annotated <- RenameIdents(denise_10x_annotated, `15` = "Tip cells", `7` = "Stalk cells", `9` = "Proliferating cells", `2` = "Proliferating cells", `12` = "Proliferating cells", `6` = "Arterial", `11` = "Arterial", `8` = "Arterial", `4` = "Venous", `5` = "Capillary", `3` = "Venous-like A", `10` = "Venous-like B", `0` = "Capillary-like A", `1` = "Capillary-like B", `13` = "Capillary-like C", `14` = "Capillary-like D")
+```
+
+Marker calling on new names
+```{r}
+markers <- FindAllMarkers(denise_10x_annotated)
+write.csv(markers, "markers_denise10x_annotated.csv", quote = F)
+```
+
+Contamination check:
+```{r}
+# adjust the featureplot legend colors to the ones as Cdh5/Pecam1.
+fix.sc <- scale_color_gradientn( colours = c('lightgrey', 'blue'),  limits = c(0.0,4.0))
+FeaturePlot(denise_10x_annotated, c("Cdh5", "Pecam1")) + fix.sc
+FeaturePlot(denise_10x_annotated, c("Pdgfra", "Crym", "Rgs5", "Vsx2")) + fix.sc
+FeaturePlot(denise_10x_annotated, c("Meg3", "Pde6h", "Nr2e3", "Ctss")) + fix.sc
+FeaturePlot(denise_10x_annotated, c("Ptprc", "Pmel", "Des", "Acta2")) + fix.sc
+```
+
+Getting fraction of cells in each cluster in cre- and cre+ conditions
+```{r}
+denise_10x_annotated <- AddMetaData(denise_10x_annotated, metadata = Idents(denise_10x_annotated), col.name = "cluster")
+table(denise_10x_annotated$cluster, denise_10x_annotated$cre)
+```
+
+# Postprocessing
+First separate the cre+ and - seurat objects
+```{r}
+obj <- SplitObject(denise_10x_annotated, split.by = "cre")
+crepos <- obj$`Cre+`
+creneg <- obj$`Cre-`
+rm(obj)
+```
+
+Table of distribution of clutsers for each hash
+```{r}
+tab_crepos <- as.data.frame.matrix(table(crepos$sample_hash, crepos$cluster))
+tab_crepos_pct <- (tab_crepos/rowSums(tab_crepos))*100
+tab_crepos <- cbind("hash"=rownames(tab_crepos), tab_crepos)  # for write_xlsx
+tab_crepos_pct <- cbind("hash"=rownames(tab_crepos_pct), tab_crepos_pct)  # for write_xlsx
+tab_creneg <- as.data.frame.matrix(table(creneg$sample_hash, creneg$cluster))
+tab_creneg_pct <- (tab_creneg/rowSums(tab_creneg))*100
+tab_creneg <- cbind("hash"=rownames(tab_creneg), tab_creneg)
+tab_creneg_pct <- cbind("hash"=rownames(tab_creneg_pct), tab_creneg_pct)  # for write_xlsx
+library(writexl)
+out <- list(tab_creneg, tab_crepos, tab_creneg_pct, tab_crepos_pct)
+names(out) <- c("cre-", "cre+", "cre- percent", "cre+ percent")
+write_xlsx(out, path = "cre_hash_celltype_distribution.xlsx")
+```
+
+# GSEA
+Loading required libraries
+```{r}
+library(singleseqgset)
+library(msigdbr)
+library(pheatmap)
+```
+
+Downloading the MSigDb data and creating a list of genes falling in each pathway category
+```{r}
+msigdb_mouse <- msigdbr(species="Mus musculus",category="H")
+msigdb_pathways <- unique(msigdb_mouse$gs_name)
+sets <- vector("list",length=length(msigdb_pathways))
+names(sets) <- msigdb_pathways
+for (i in names(sets)) {
+  sets[[i]] <- pull(msigdb_mouse[msigdb_mouse$gs_name==i,"gene_symbol"])
+}
+```
+
+GSEA analysis
+```{r}
+# write function so that it can be called for different seurat objects
+rungsea_seurat <- function(object, sets){
+  # return the list of cells in each cluster and genes with logfc calculation in each cluster against other clusters
+  logfc.data <- logFC(cluster.ids=object@meta.data$cluster, expr.mat=object@assays$RNA@data)
+  names(logfc.data)
+  # calculation of enrichment scores and pvalue
+  gse.res <- wmw_gsea(expr.mat=object@assays$RNA@data, cluster.cells=logfc.data[[1]],log.fc.cluster=logfc.data[[2]], gene.sets=sets)
+  gse.res[["GSEA_p_values"]] <- apply(gse.res[["GSEA_p_values"]], 2, p.adjust,method="fdr") #Correct for multiple comparisons
+  gse.res[["GSEA_statistics"]][order( gse.res[["GSEA_statistics"]][,1], decreasing=TRUE)[1:10],] # Top gene sets enriched by z scores
+  return(gse.res)
+}
+```
+
+Calling the function on whole seurat object + seurat object separated for cre+ and cre-
+```{r}
+gsea_res_whole <- rungsea_seurat(denise_10x_annotated, sets)
+gsea_res_crepos <- rungsea_seurat(crepos, sets)
+gsea_res_creneg <- rungsea_seurat(creneg, sets)
+```
+
+Result plotting in a heatmap
+```{r}
+breaksList = seq(-13, 7, by = 0.1)  # max and min of all enrichments
+pheatmap(gsea_res_whole$GSEA_statistics, Colv=NA, cexRow=0.5, cexCol=1, breaks = breaksList, colorRampPalette(rev(brewer.pal(n = 7, name = "PiYG")))(length(breaksList)), filename = "gsea_whole.png", width = 15, height = 10)
+pheatmap(gsea_res_crepos$GSEA_statistics, Colv=NA, cexRow=0.5, cexCol=1, breaks = breaksList, colorRampPalette(rev(brewer.pal(n = 7, name = "PiYG")))(length(breaksList)), filename = "gsea_crepos.png", width = 15, height = 10)
+pheatmap(gsea_res_creneg$GSEA_statistics, Colv=NA, cexRow=0.5, cexCol=1, breaks = breaksList, colorRampPalette(rev(brewer.pal(n = 7, name = "PiYG")))(length(breaksList)), filename = "gsea_creneg.png", width = 15, height = 10)
+# saving z-score numbers to an excel file
+outlist <- list(gsea_res_whole$GSEA_statistics, gsea_res_crepos$GSEA_statistics, gsea_res_creneg$GSEA_statistics)
+names(outlist) <- c("Whole", "Cre+", "Cre-")
+outlist <- lapply(outlist, function(x) cbind("pathway"=rownames(x), x))   # for xls writing
+write_xlsx(outlist, path = "gsea_zscores.xlsx")
+# saving p-values to an excel file
+outlist_pval <- list(gsea_res_whole$GSEA_p_values, gsea_res_crepos$GSEA_p_values, gsea_res_creneg$GSEA_p_values)
+names(outlist_pval) <- c("Whole", "Cre+", "Cre-")
+outlist_pval <- lapply(outlist_pval, function(x) cbind("pathway"=rownames(x), x))   # for xls writing
+write_xlsx(outlist_pval, path = "gsea_pvalues.xlsx")
+```
+
+GSEA dotplots
+```{r}
+plotdotplotGSEA <- function(gseres, flag){
+  library(scales)     # for rescaling from -3 to 3
+  stats <- gseres$GSEA_statistics
+  stats <- as.data.frame(t(apply(stats, 1, rescale, to=c(-5,5))))
+  stats$pathway <- rownames(stats)
+  # similary create molten dataframe for pvalues and add the values to the stat dataframe
+  pvals <- gseres$GSEA_p_values
+  molten_pvals <- melt(pvals)
+  molten_pvals$id <- paste(molten_pvals$Var1, "__", molten_pvals$Var2, sep = "")
+  molten_stats <- melt(stats)
+  molten_stats$id <- paste(molten_stats$pathway, "__", molten_stats$variable, sep = "")
+  molten_stats$pvalue <- molten_pvals$value[match(molten_pvals$id, molten_stats$id)]
+  # pval colors
+  cols <- c("#d73027", "darkgrey", "#4575b4")
+  p <- ggplot(molten_stats, aes(x=variable, y=pathway, size=value))  
+  p <- p +  geom_point(aes(color =pvalue)) + theme_bw()
+  p <- p +  xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_y_discrete(limits=rev)
+  p <- p +  scale_colour_gradient(low =  "#756bb1", high = "#efedf5")
+  png(paste("dotplot_GSEA_", flag, ".png", sep = ""), width = 800, height = 1200)
+  print(p)
+  dev.off()
+}
+plotdotplotGSEA(gseres = gsea_res_whole, "whole")
+plotdotplotGSEA(gseres = gsea_res_creneg, "creneg")
+plotdotplotGSEA(gseres = gsea_res_crepos, "crepos")
+```
+
+GSEA analysis including all pathways together
+```{r}
+msigdb_mouse <- msigdbr(species="Mus musculus")
+msigdb_pathways <- unique(msigdb_mouse$gs_name)
+sets <- vector("list",length=length(msigdb_pathways))
+names(sets) <- msigdb_pathways
+for (i in names(sets)) {
+  sets[[i]] <- pull(msigdb_mouse[msigdb_mouse$gs_name==i,"gene_symbol"])
+}
+# runninng enrichment again for all pathways
+gsea_res_whole_all <- rungsea_seurat(denise_10x_annotated, sets)
+gsea_res_crepos_all <- rungsea_seurat(crepos, sets)
+gsea_res_creneg_all <- rungsea_seurat(creneg, sets)
+# saving z-score numbers to an excel file (enrichment all pathways)
+outlist_allpathways <- list(gsea_res_whole_all$GSEA_statistics, gsea_res_crepos_all$GSEA_statistics, gsea_res_creneg_all$GSEA_statistics)
+names(outlist_allpathways) <- c("Whole", "Cre+", "Cre-")
+outlist_allpathways <- lapply(outlist_allpathways, function(x) cbind("pathway"=rownames(x), x))   # for xls writing
+write_xlsx(outlist_allpathways, path = "gsea_zscores_allpathways.xlsx")
+```
+
+# Differential expression cre- vs cre+
+First, adjust the name of the clusters
+```{r}
+denise_10x_annotated$celltype.condition <- paste(denise_10x_annotated$cluster, denise_10x_annotated$cre, sep="__")
+temp_denise_10x_annotated <- denise_10x_annotated  # as idents will be changed, perform this operation on a temp object and later delete
+Idents(temp_denise_10x_annotated) <- "celltype.condition"    # for differential expression as FindMarkers will look for these
+list_diffgenes_cre <- list()
+for (i in unique(as.character(temp_denise_10x_annotated$cluster))){ #or however many clusters you have
+  try({
+    print(i)
+    ident1 <- paste0(i,"__Cre-")
+    ident2 <- paste0(i,"__Cre+")
+    condition.diffgenes <- FindMarkers(temp_denise_10x_annotated, ident.1 = ident1, ident.2=ident2, min.pct=0.25, logfc.threshold=0)
+    list_diffgenes_cre[[i]] <- condition.diffgenes
+    write.csv(condition.diffgenes, file=paste0("diffgenes_new_",i,"_cre-cre+.csv"))
+  })
+}
+list_diffgenes_cre <- lapply(list_diffgenes_cre, function(x) cbind("genes"=rownames(x), x))   # for xls writing
+write_xlsx(list_diffgenes_cre, path = "diffgenes_cre-cre+.xlsx")
+```
+
+Modify the Gsea function to run differential expression per cluster for conditions
+```{r}
+# GSEA hallmark set
+msigdb_mouse_h <- msigdbr(species="Mus musculus", category = "H")
+msigdb_pathways_h <- unique(msigdb_mouse_h$gs_name)
+sets_h <- vector("list",length=length(msigdb_pathways_h))
+names(sets_h) <- msigdb_pathways_h
+for (i in names(sets_h)) {
+  sets_h[[i]] <- pull(msigdb_mouse_h[msigdb_mouse_h$gs_name==i,"gene_symbol"])
+}
+# function
+rungsea_seurat_conditions <- function(object, sets){
+  # return the list of cells in each cluster and genes with logfc calculation in each cluster against other clusters
+  logfc.data <- logFC(cluster.ids=object@meta.data$cre, expr.mat=object@assays$RNA@data)
+  names(logfc.data)
+  # calculation of enrichment scores and pvalue
+  gse.res <- wmw_gsea(expr.mat=object@assays$RNA@data, cluster.cells=logfc.data[[1]],log.fc.cluster=logfc.data[[2]], gene.sets=sets)
+  gse.res[["GSEA_p_values"]] <- apply(gse.res[["GSEA_p_values"]], 2, p.adjust,method="fdr") # Correct for multiple comparisons
+  gse.res[["GSEA_statistics"]][order( gse.res[["GSEA_statistics"]][,1], decreasing=TRUE)[1:10],] # Top gene sets enriched by z scores
+  return(gse.res)
+}
+```
+
+Run GSEA on these differentially expressed genes to see which pathways are different in cre- versus cre+
+For this, run the above GSEA function for individual cluster.
+```{r}
+list_gsea_cre_logfc <- list()
+list_gsea_cre_pval <- list()
+for (eachcluster in as.character(unique(Idents(denise_10x_annotated)))){
+  print(eachcluster)
+  # now subset the seurat object only for that cluster
+  subset_seurat <- subset(denise_10x_annotated, idents = eachcluster)
+  gse.res <- rungsea_seurat_conditions(subset_seurat, sets_h)
+  list_gsea_cre_logfc[[eachcluster]] <- gse.res$GSEA_statistics
+  list_gsea_cre_pval[[eachcluster]] <- gse.res$GSEA_p_values
+}
+list_gsea_cre_logfc <- lapply(list_gsea_cre_logfc, function(x) cbind("pathway"=rownames(x), x))   # for xls writing
+list_gsea_cre_pval <- lapply(list_gsea_cre_pval, function(x) cbind.data.frame("pathway"=rownames(x), x))   # for xls writing
+
+write_xlsx(list_gsea_cre_logfc, path = "gsea_cre_hallmark.xlsx")
+```
+
+Now combine all cre+ z-score values and plot the dotplot
+```{r}
+library(data.table)  # for merging list elements
+# melting and merging of logFC dataframe
+list_gsea_cre_logfc_dotplot <- lapply(seq_along(list_gsea_cre_logfc), function(i) {list_gsea_cre_logfc[[i]]$celltype <- rep(names(list_gsea_cre_logfc)[i], nrow(list_gsea_cre_logfc[[i]])) ; return(list_gsea_cre_logfc[[i]])})
+list_gsea_cre_logfc_dotplot <- lapply(list_gsea_cre_logfc_dotplot, function(x) melt(x, id.vars = c("pathway", "celltype"), measure.vars = "Cre+"))     # melt all dataframes logFC
+df_gsea_cre_logfc_dotplot <- rbindlist(list_gsea_cre_logfc_dotplot, use.names=T, fill=FALSE) # merge all dataframes in one 
+df_gsea_cre_logfc_dotplot$id <- paste(df_gsea_cre_logfc_dotplot$pathway, "__", df_gsea_cre_logfc_dotplot$celltype, sep="") # id to match with pvalue df
+# melting and merging of logFC dataframe
+list_gsea_cre_pval_dotplot <- lapply(seq_along(list_gsea_cre_pval), function(i) {list_gsea_cre_pval[[i]]$celltype <- as.character(rep(names(list_gsea_cre_pval)[i], nrow(list_gsea_cre_pval[[i]]))) ; return(list_gsea_cre_pval[[i]])})
+list_gsea_cre_pval_dotplot <- lapply(list_gsea_cre_pval_dotplot, function(x) melt(x, id.vars = c("pathway", "celltype"), measure.vars = "Cre+"))     # melt all dataframes logFC
+df_gsea_cre_pval_dotplot <- rbindlist(list_gsea_cre_pval_dotplot, use.names=T, fill=FALSE) # merge all dataframes in one 
+df_gsea_cre_pval_dotplot$id <- paste(df_gsea_cre_pval_dotplot$pathway, "__", df_gsea_cre_pval_dotplot$celltype, sep="") 
+
+# now match the pvalue columns with logfc df columns to bring pvalue info to logfc info
+df_gsea_cre_logfc_dotplot$pval <- df_gsea_cre_pval_dotplot$value[match(df_gsea_cre_pval_dotplot$id, df_gsea_cre_logfc_dotplot$id)]
+
+# dotplot
+p <- ggplot(df_gsea_cre_logfc_dotplot, aes(x=celltype, y=pathway, size=value))  
+p <- p +  geom_point(aes(color = pval)) + theme_bw()
+p <- p +  xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_y_discrete(limits=rev)
+p <- p +  scale_colour_gradient(low =  "#756bb1", high = "#efedf5")
+```
+
+# Pseudo-bulk
+Re-doing the pseudobulk because this needs to be done with replicates kept separate in order to get differential expression pvalues(01-02-2023)
+```{r}
+library(Matrix.utils)
+library(DESeq2)
+## initial processing
+counts <- denise_10x_annotated@assays$RNA@counts    # Extracting raw counts and metadata to create SingleCellExperiment object
+metadata <- denise_10x_annotated@meta.data          # Set up metadata as desired for aggregation and DE analysis
+metadata$cluster_id <- factor(denise_10x_annotated@active.ident) 
+## Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+sce$sample_hash <- factor(sce$sample_hash)
+sce$cre <- factor(sce$cre)
+## aggregation
+groups <- colData(sce)[, c("sample_hash")]
+pb <- aggregate.Matrix(t(counts(sce)), groupings = groups, fun = "sum") # Aggregate across cluster-sample groups
+## creating deseq object for further analysis
+metadata <- data.frame(rownames(pb))
+metadata$sampleid <- metadata$rownames.pb.
+metadata$samplename <- unlist(lapply(metadata$sampleid, function(x) strsplit(x, "_")[[1]][1]))
+metadata$hash <- unlist(lapply(metadata$sampleid, function(x) strsplit(x, "_")[[1]][2]))
+metadata$cre <- hash_cre_df$V2[match(metadata$sampleid, hash_cre_df$V1)]
+rownames(metadata) <- metadata$sampleid
+metadata$cre <- ifelse(metadata$cre == "Cre+", "pos", "neg")
+dds <- DESeqDataSetFromMatrix(t(pb+1), colData = metadata, design = ~ cre)
+dds <- DESeq(dds)
+res <- results(dds)
+res$padj[is.na(res$padj)] <- 1
+```
+
+GSE analysis on DESeq2 output
+```{r}
+library(fgsea)
+library(data.table)
+library(enrichplot)   # for visualization
+pathways <- gmtPathways("/home/s467i/mh.all.v2022.1.Mm.symbols.gmt")
+# from tutorial https://stephenturner.github.io/deseq-to-fgsea/, stats columns was taken as the ranking column
+ranks <- res$stat
+names(ranks) <- rownames(res)
+fgseaRes <- fgseaMultilevel(pathways = pathways, stats = ranks, minSize  = 15, maxSize  = 500)
+# add generatio info
+fgseaRes$enrichedgenes <- unlist(lapply(fgseaRes$leadingEdge, length))
+fgseaRes$generatio <- fgseaRes$enrichedgenes/fgseaRes$size
+# Write results to a file
+fwrite(fgseaRes, file="pathway_enrichment_pseudobulk.csv", sep=",", sep2=c("", "|", ""))
+```
+
+Graphics for pathway enrichment
+```{r}
+fgseaRes_dotplot <- data.frame(fgseaRes$pathway, fgseaRes$pval, fgseaRes$padj, fgseaRes$NES, fgseaRes$generatio)
+fgseaRes_dotplot <- fgseaRes_dotplot[order(fgseaRes_dotplot$fgseaRes.generatio),]
+fgseaRes_dotplot$fgseaRes.pathway <- factor(fgseaRes_dotplot$fgseaRes.pathway, levels = fgseaRes_dotplot$fgseaRes.pathway)
+
+dotplot1 <- ggplot(fgseaRes_dotplot[fgseaRes_dotplot$fgseaRes.NES > 0,], aes(x=fgseaRes.generatio , y=fgseaRes.pathway, size=fgseaRes.NES)) + geom_point(aes(color = -log10(fgseaRes.pval))) + theme_bw() + xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_colour_gradient(high =  "red", low = "blue") # + scale_colour_gradient(high =  "#756bb1", low = "#efedf5")
+dotplot2 <- ggplot(fgseaRes_dotplot[fgseaRes_dotplot$fgseaRes.NES < 0,], aes(x=fgseaRes.generatio , y=fgseaRes.pathway, size=abs(fgseaRes.NES))) + geom_point(aes(color = -log10(fgseaRes.pval))) + theme_bw() + xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_colour_gradient(high =  "red", low = "blue")
+png("dotplot_GSEA_pseudobulk_replicates.png", width = 1200, height = 1000)
+grid.arrange(dotplot1, dotplot2, nrow=1)
+dev.off()
+```
+
+Writing pseudo-bulk outputs to a file
+```{r}
+# count matrix
+cm_pb <- as.data.frame(t(pb))
+cm_pb <- cm_pb[metadata$sampleid[order(metadata$cre, decreasing = T)]]
+write.csv(cm_pb, "count_matrix_pseudobulk_replicates.csv", quote = F)
+# save the normalized count matrix
+write.csv(counts(dds, normalized=T), "count_matrix_pseudobulk_normalized_replicates.csv", quote = F)
+# differential expression
+write.csv(res, "differential_expression_pseudobulk_replicates.csv", quote = F)
+```
+
+Volcano plot for the differential expression
+```{r}
+library(EnhancedVolcano)
+highlight_genes <- c("Slc38a3", "Slc7a5", "Slc7a1", "Bax", "Fas", "Terf1")
+EnhancedVolcano(res, lab = rownames(res), x = 'log2FoldChange', y = 'pvalue', FCcutoff = 0.5, pCutoff = 0.05, selectLab = highlight_genes, drawConnectors = T)
+```
+
+# GSEA with replicates on cluster-level DE genes
+```{r}
+gsea_with_replicates <- function(cluster){
+  ## subsetting and DEseq analysis
+  sce_cluster <- sce[,colData(sce)$cluster_id == cluster]
+  groups_cluster <- colData(sce_cluster)[, c("sample_hash")]
+  pb_cluster <- aggregate.Matrix(t(counts(sce_cluster)), groupings = groups_cluster, fun = "sum") # Aggregate across cluster-sample groups
+  ## creating deseq object for further analysis
+  metadata_cluster <- data.frame(rownames(pb_cluster))
+  metadata_cluster$sampleid <- metadata_cluster$rownames.pb_cluster.
+  metadata_cluster$samplename <- unlist(lapply(metadata_cluster$sampleid, function(x) strsplit(x, "_")[[1]][1]))
+  metadata_cluster$hash <- unlist(lapply(metadata_cluster$sampleid, function(x) strsplit(x, "_")[[1]][2]))
+  metadata_cluster$cre <- hash_cre_df$V2[match(metadata_cluster$sampleid, hash_cre_df$V1)]
+  rownames(metadata_cluster) <- metadata_cluster$sampleid
+  metadata_cluster$cre <- ifelse(metadata_cluster$cre == "Cre+", "pos", "neg")
+  dds_cluster <- DESeqDataSetFromMatrix(t(pb_cluster+1), colData = metadata_cluster, design = ~ cre)
+  dds_cluster <- DESeq(dds_cluster)
+  res_cluster <- results(dds_cluster)
+  res_cluster$padj[is.na(res_cluster$padj)] <- 1
+  
+  ## fgsea analysis on these results
+  ranks_cluster <- res_cluster$stat
+  names(ranks_cluster) <- rownames(res_cluster)
+  fgseaRes_cluster <- fgseaMultilevel(pathways = pathways, stats = ranks_cluster, minSize  = 15, maxSize  = 500)
+  # add generatio info
+  fgseaRes_cluster$enrichedgenes <- unlist(lapply(fgseaRes_cluster$leadingEdge, length))
+  fgseaRes_cluster$generatio <- fgseaRes_cluster$enrichedgenes/fgseaRes_cluster$size
+  return(fgseaRes_cluster)
+}
+
+# Now run this function for all clusters and store results in a file
+list_gsea_cluster_replicates <- list()
+for (eachcluster in unique(Idents(denise_10x_annotated))){
+  print(eachcluster)
+  outgsea <- gsea_with_replicates(eachcluster)
+  list_gsea_cluster_replicates[[eachcluster]] <- outgsea
+}
+write_xlsx(list_gsea_cluster_replicates, path = "gsea_percluster_replicates.xlsx")
+```
+
+Plotting above results
+```{r}
+
+```
+
+<!-- Heatmap for top up-regulated genes -->
+<!-- ```{r} -->
+<!-- topgenes <- rownames(res[((res$log2FoldChange > 1) & (res$padj < 0.05) & (res$baseMean >= 20)),]) -->
+<!-- library(pheatmap) -->
+<!-- pheatmap(log(cm_pb[topgenes,]+1), cluster_cols = F, angle_col = 45, annotation_col = subset(metadata, select = cre)) -->
+<!-- ``` -->
+
+# Graphics on demand
+Featureplot + violin plots for the genes that Ashik wanted 27-01-2023
+```{r}
+library(patchwork)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(lattice)
+genes <- c("Smad6", "Smad7", "Smad2", "Smad3", "Smad1", "Smad5", "Smad9", "Smad4", "Tgfbr1", "Tgfbr2", "Bmpr2", "Notch1", "Klf2", "Klf4")
+for (eachgene in genes){
+  print(eachgene)
+  p1 <- FeaturePlot(denise_10x_annotated, eachgene, label = T, split.by = "cre", combine = F)
+  p2 <- VlnPlot(denise_10x_annotated, eachgene, split.by = "cre")
+  out <- (p1[[1]] | p1[[2]])/p2
+  png(paste("plot_", eachgene, ".png", sep = ""), width = 1500, height = 800)
+  print(out)
+  dev.off()
+}
+rm(p1, p2, out)
+```
+
+Dotplot for GSEA results pseudobulk
+```{r}
+pb_df <- cbind(gse.res$GSEA_statistics[,"Cre+"], gse.res$GSEA_p_values[,"Cre+"], as.data.frame(rep("pb", 50)))
+colnames(pb_df) <- c("ES", "pvalue", "id")
+rownames(pb_df) <- rownames(gse.res$GSEA_statistics)
+pb_df$pathway <- rownames(pb_df)
+pb_df_sorted <- pb_df[order(pb_df$ES, decreasing =T),]
+pb_df_sorted$pathway <- factor(pb_df_sorted$pathway, levels = rev(rownames(pb_df_sorted)))
+
+p1 <- ggplot(pb_df_sorted[pb_df_sorted$ES > 0,], aes(x=id , y=pathway, size=ES)) + geom_point(aes(color = -log10(pvalue))) + theme_bw() + xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_colour_gradient(high =  "#756bb1", low = "#efedf5")
+p2 <- ggplot(pb_df_sorted[pb_df_sorted$ES < 0,], aes(x=id , y=pathway, size=abs(ES))) + geom_point(aes(color = -log10(pvalue))) + theme_bw() + xlab("") + theme(axis.text.x=element_text(angle = -30, hjust = 0)) + scale_colour_gradient(high =  "#756bb1", low = "#efedf5")
+png("dotplot_GSEA_pseudobulk.png", width = 1000, height = 1000)
+grid.arrange(p1, p2, nrow=1)
+dev.off()
+```
+
+UMAP plots without stalk cell cluster (Asked by Denise 06-02-2023)
+```{r}
+remove_cells <- c("sampleB_hash10_AGGCCGTTCTTGCATT-1", "sampleB_hash7_GTATTCTAGATCTGAA-1",
+                  "sampleB_hash7_TCATTTGGTCCAGTGC-1", "sampleB_hash3_AAACGGGGTGTGCCTG-1")
+remove_cells <- c(remove_cells, WhichCells(denise_10x_annotated, idents = "Stalk cells"))
+denise_10x_annotated_temp <- subset(x = denise_10x_annotated, cells = remove_cells, invert = TRUE)
+# plots
+UMAPPlot(denise_10x_annotated_temp, label = T)
+DimPlot(denise_10x_annotated_temp, label = T, split.by = "cre")
+VlnPlot(denise_10x_annotated_temp, "Terf1", split.by = "cre")
+```
+
+# Trajectory information
+Saving the cell and genenames that in the end were used for the analysis
+```{r}
+cells_A <- rownames(denise_10x_annotated@meta.data)[which(denise_10x_annotated@meta.data$sample=="sampleA")]
+cells_A <- unlist(lapply(cells_A, function(x) strsplit(x, "-")[[1]][1]))
+write.csv(cells_A, "cellnames_SampleA.csv", quote = F, col.names = F, row.names = F)
+cells_B <- rownames(denise_10x_annotated@meta.data)[which(denise_10x_annotated@meta.data$sample=="sampleB")]
+cells_B <- unlist(lapply(cells_B, function(x) strsplit(x, "-")[[1]][1]))
+write.csv(cells_B, "cellnames_SampleB.csv", quote = F, col.names = F, row.names = F)
+genes <- rownames(denise_10x_annotated@assays$RNA@counts)
+write.csv(genes, "genenames.csv", quote = F, col.names = F, row.names = F)
+```
+
+Following code to convert python to anndata from Theis lab website # https://theislab.github.io/scanpy-in-R/
+```{r}
+exprs <- GetAssayData(denise_10x_annotated)
+meta <- denise_10x_annotated[[]]
+feature_meta <- GetAssay(denise_10x_annotated)[[]]
+embedding <- Embeddings(denise_10x_annotated, "umap")
+# write above objects to files in order to load in python
+write.csv(t(exprs), "exprs_denise_10x_annotated.csv", quote = F)  # anndata needs transposed count matrix
+write.csv(meta, "meta_denise_10x_annotated.csv", quote = F)
+write.csv(feature_meta, "feature_meta_denise_10x_annotated.csv", quote = F)
+write.csv(embedding, "embedding_denise_10x_annotated.csv", quote = F)
+```
+
+Another attemp via singlecellexperiment object (did not work)
+```{r}
+library(zellkonverter)
+sce_denise_10x <- as.SingleCellExperiment(denise_10x_annotated)
+writeH5AD(sce_denise_10x, "denise_10x_annotated.h5ad")
+
+sceasy::convertFormat(seurat_object, from="seurat", to="anndata", outFile='denise_10x_annotated.h5ad')
+```
+
+
+<!-- Plotting featureplots with better view -->
+<!-- ```{r} -->
+<!-- pal <- viridis(n = 12, option = "C", direction = -1) -->
+<!-- pal <- brewer.pal(12, "Set3") -->
+<!-- DimPlot(denise_10x_annotated, cols = pal) -->
+<!-- pal <- brewer.pal(12, "Paired") -->
+<!-- FeaturePlot(object = denise_10x, features = "Hmgn2", order = T) -->
+<!-- FeaturePlot(object = denise_10x, features = "Hmgn2", order = T, cols = pal) -->
+<!-- ``` -->
