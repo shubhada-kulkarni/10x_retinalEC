@@ -80,3 +80,19 @@ df.to_csv('markergenes_scanpy.csv')
 
 # checking marker expressions in clusters
 scv.pl.umap(adata, color=['louvain', "Col4a1", "Apol7d", "Cd93", "Nid1"])
+
+# read the cluster information from Seurat
+seurat_metadata = pd.read_csv("seurat_metadata.csv", index_col = 0, dtype=str)
+dict_cluster = dict(zip(seurat_metadata.index, seurat_metadata.cluster))
+## Seurat metadata has -1 and -2 in their cellnames. So replace these with -A and -B
+adata.obs.index = [word.replace('-A', '-1') for word in adata.obs.index]
+adata.obs.index = [word.replace('-B', '-1') for word in adata.obs.index]
+# mapping
+adata.obs['seurat_clusters'] = (adata.obs.index.map(dict_cluster).astype('category'))
+
+# color the UMAP based on seurat clusters
+scv.pl.umap(adata, color=['louvain', "seurat_clusters"])
+
+# the clustering for Seurat and Scanpy looked different so decided to also import the embeddings from Seurat
+X_umap = pd.read_csv("seurat_embeddings.csv", index_col = 0, dtype=str)
+adata.obsm['X_umap'] = X_umap.loc[adata.obs_names].values
