@@ -50,13 +50,6 @@ scv.tl.louvain(adata, resolution = 2)
 scv.pl.umap(adata, color='louvain')   # plotting the umap with clusters
 scv.pl.umap(adata, color=['louvain'])
 
-# Estimating the RNA velocity
-scv.tl.velocity(adata)
-scv.tl.velocity_graph(adata)
-
-# Project the velocities
-scv.pl.velocity_embedding_stream(adata, basis='umap')
-scv.pl.velocity_embedding(adata, arrow_length=3, arrow_size=2, dpi=120)
 
 # add the cre and the cluster information from Seurat to the anndata object
 adata.obs['sample_hash'] = ['_'.join(i.split('_')[:2]) for i in adata.obs_names.to_list()]
@@ -94,5 +87,61 @@ adata.obs['seurat_clusters'] = (adata.obs.index.map(dict_cluster).astype('catego
 scv.pl.umap(adata, color=['louvain', "seurat_clusters"])
 
 # the clustering for Seurat and Scanpy looked different so decided to also import the embeddings from Seurat
-X_umap = pd.read_csv("seurat_embeddings.csv", index_col = 0, dtype=str)
+X_umap = pd.read_csv("seurat_embeddings.csv", index_col = 0) #, dtype=str)
 adata.obsm['X_umap'] = X_umap.loc[adata.obs_names].values
+
+# Separate creneg and crepos
+adata_neg = adata[adata.obs['cre'].isin(["neg"])]
+adata_pos = adata[adata.obs['cre'].isin(["pos"])]
+
+# Estimating the RNA velocity
+scv.tl.velocity(adata_neg)
+scv.tl.velocity_graph(adata_neg)
+scv.tl.velocity(adata_pos)
+scv.tl.velocity_graph(adata_pos)
+
+# Project the velocities (coloring the cells based on Seurat clusteres)
+scv.pl.velocity_embedding_stream(adata, basis='umap', color = "seurat_clusters")
+scv.pl.velocity_embedding(adata, arrow_length=3, arrow_size=2, dpi=120, color = "seurat_clusters")
+scv.pl.velocity_embedding_stream(adata_neg, basis='umap', color = "seurat_clusters")
+scv.pl.velocity_embedding_stream(adata_pos, basis='umap', color = "seurat_clusters")
+
+# to identify genes that may help explain the resulting vector field and inferred lineages. 
+scv.tl.rank_velocity_genes(adata, groupby='seurat_clusters', min_corr=.3)
+df = scv.DataFrame(adata.uns['rank_velocity_genes']['names'])
+df.head()
+
+# Speed and coherence
+scv.tl.velocity_confidence(adata)
+keys = 'velocity_length', 'velocity_confidence'
+scv.pl.scatter(adata, c=keys, cmap='coolwarm', perc=[5, 95])
+
+# Velocity graph and pseudotime
+scv.tl.velocity_pseudotime(adata, groupby="seurat_clusters")
+
+# Velocity clusters
+scv.tl.velocity_clusters(adata)
+scv.pl.scatter(adata, color='velocity_clusters')
+
+# Latent time (cell’s internal clock and approximates the real time experienced by cells as they differentiate, based only on its transcriptional dynamics)
+scv.tl.recover_dynamics(adata_neg)
+scv.tl.latent_time(adata_neg)
+scv.tl.recover_dynamics(adata_pos)
+scv.tl.latent_time(adata_pos)
+scv.pl.scatter(adata_neg, color='latent_time', color_map='gnuplot', size=80)
+scv.pl.scatter(adata_pos, color='latent_time', color_map='gnuplot', size=80)
+
+# based on latent time, plot the top genes
+top_genes = adata.var['fit_likelihood'].sort_values(ascending=False).index[:300]
+scv.pl.heatmap(adata_neg, var_names=top_genes, sortby='latent_time', col_color='seurat_clusters', n_convolve=100)
+scv.pl.heatmap(adata_pos, var_names=top_genes, sortby='latent_time', col_color='seurat_clusters', n_convolve=100)
+
+# cluster specific identification of specific drivers
+scv.tl.rank_dynamical_genes(adata, groupby='seurat_clusters')
+df = scv.get_df(adata, 'rank_dynamical_genes/names')
+df.head(5)
+
+# check genes for in-silico perturbation
+check_genes = ["Slc7a1","Slc7a5","Slc38a3","Mtor","Rps6","Bax", "Tie1", "Tek/Tie2"]
+
+## Dynamo in silico perturbation
